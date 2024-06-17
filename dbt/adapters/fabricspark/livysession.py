@@ -8,21 +8,24 @@ import re
 import datetime as dt
 from types import TracebackType
 from typing import Any
-import dbt.exceptions
-from dbt.events import AdapterLogger
-from dbt.utils import DECIMALS
+
+from dbt_common.exceptions import DbtDatabaseError
+from dbt.adapters.exceptions.connection import FailedToConnectError
+from dbt.adapters.events.logging import AdapterLogger
+from dbt_common.utils.encoding import DECIMALS
 from azure.core.credentials import AccessToken
 from azure.identity import AzureCliCredential, ClientSecretCredential
 from dbt.adapters.fabricspark.fabric_spark_credentials import SparkCredentials
 from dbt.adapters.fabricspark.shortcuts import ShortcutClient
+from dbt.adapters.fabricspark.livyenums import LivyStates
 
 logger = AdapterLogger("Microsoft Fabric-Spark")
 NUMBERS = DECIMALS + (int, float)
 
 livysession_credentials: SparkCredentials
 
-DEFAULT_POLL_WAIT = 45
-DEFAULT_POLL_STATEMENT_WAIT = 5
+DEFAULT_SESSION_POLL_WAIT = 10
+DEFAULT_STATEMENT_POLL_WAIT = 2
 AZURE_CREDENTIAL_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
 accessToken: AccessToken = None
 
@@ -109,7 +112,7 @@ def get_headers(credentials: SparkCredentials, tokenPrint: bool = False) -> dict
 class LivySession:
     def __init__(self, credentials: SparkCredentials):
         self.credential = credentials
-        self.connect_url = credentials.lakehouse_endpoint
+        self.connect_url = credentials.livy_endpoint
         self.session_id = None
         self.is_new_session_required = True
 
@@ -124,11 +127,39 @@ class LivySession:
     ) -> bool:
         # self.delete_session()
         return True
+    
+    def _await_session_start(self):
+
+        start_time = time.time()
+        elapsed_time = 0
+ 
+        while True:
+            elapsed_time = time.time() - start_time
+            remaining_time = self.credentials.session_provisioning_timeout - elapsed_time
+            
+            res = requests.get(
+                self.connect_url + "/sessions/" + self.session_id,
+                headers=get_headers(self.credential, False),
+            ).json()
+
+            if res["state"] in [LivyStates.NOT_STARTED, LivyStates.STARTING]:                
+                # logger.debug("Polling Session creation status - ", self.connect_url + '/sessions/' + self.session_id )
+                time.sleep(min(DEFAULT_SESSION_POLL_WAIT, remaining_time))
+            elif res["livyInfo"]["currentState"] == LivyStates.IDLE:
+                logger.debug(f"Started livy session {self.session_id} in {elapsed_time} seconds")
+                self.is_new_session_required = False
+                break
+            elif res["livyInfo"]["currentState"] == LivyStates.DEAD:
+                print("ERROR, cannot create a livy session")
+                raise FailedToConnectError("Failed to create a livy session")
+            
+            if remaining_time <= 0:
+                self.delete_session()
+                raise TimeoutError(f"Livy session took more than {self.credentials.session_provisioning_timeout} seconds to start")
 
     def create_session(self, data) -> str:
-        # Create sessions
         response = None
-        print("Creating Livy session (this may take a few minutes)")
+        logger.debug(f"Creating livy session...")
         try:
             response = requests.post(
                 self.connect_url + "/sessions",
@@ -156,30 +187,15 @@ class LivySession:
         except requests.exceptions.JSONDecodeError as json_err:
             raise Exception("Json decode error to get session_id") from json_err
 
-        # Wait for started state
-        while True:
-            res = requests.get(
-                self.connect_url + "/sessions/" + self.session_id,
-                headers=get_headers(self.credential, False),
-            ).json()
-            if res["state"] == "starting" or res["state"] == "not_started":                
-                # logger.debug("Polling Session creation status - ", self.connect_url + '/sessions/' + self.session_id )
-                time.sleep(DEFAULT_POLL_WAIT)
-            elif res["livyInfo"]["currentState"] == "idle":
-                logger.debug(f"New livy session id is: {self.session_id}, {res}")
-                self.is_new_session_required = False
-                break
-            elif res["livyInfo"]["currentState"] == "dead":
-                print("ERROR, cannot create a livy session")
-                raise dbt.exceptions.FailedToConnectException("failed to connect")
-        print("Livy session created successfully")
+        self._await_session_start()
+        
         return self.session_id
 
     def delete_session(self) -> None:
         logger.debug(f"Closing the livy session: {self.session_id}")
 
         try:
-            # delete the session_id
+            # delete the livy session
             _ = requests.delete(
                 self.connect_url + "/sessions/" + self.session_id,
                 headers=get_headers(self.credential, False),
@@ -198,9 +214,9 @@ class LivySession:
             headers=get_headers(self.credential, False),
         ).json()
 
-        # we can reuse the session so long as it is not dead, killed, or being shut down
-        invalid_states = ["dead", "shutting_down", "killed"]
-        return res["livyInfo"]["currentState"] not in invalid_states
+        valid_states = [LivyStates.IDLE, LivyStates.RUNNING, LivyStates.SUCCESS, LivyStates.BUSY]
+
+        return res["livyInfo"]["currentState"] in valid_states
 
 
 # cursor object - wrapped for livy API
@@ -217,7 +233,7 @@ class LivyCursor:
         self._rows = None
         self._schema = None
         self.credential = credential
-        self.connect_url = credential.lakehouse_endpoint
+        self.connect_url = credential.livy_endpoint
         self.session_id = livy_session.session_id
         self.livy_session = livy_session
 
@@ -286,42 +302,78 @@ class LivyCursor:
         logger.debug(
             f"Submitted: {data} {self.connect_url + '/sessions/' + self.session_id + '/statements'}"
         )
+
         res = requests.post(
             self.connect_url + "/sessions/" + self.session_id + "/statements",
             data=json.dumps(data),
             headers=get_headers(self.credential, False),
         )
+
         return res
 
     def _getLivySQL(self, sql) -> str:
-        # Comment, what is going on?!
-        # The following code is actually injecting SQL to pyspark object for executing it via the Livy session - over an HTTP post request.
-        # Basically, it is like code inside a code. As a result the strings passed here in 'escapedSQL' variable are unescapted and interpreted on the server side.
-        # This may have repurcursions of code injection not only as SQL, but also arbritary Python code. An alternate way safer way to acheive this is still unknown.
-        # escapedSQL = sql.replace("\n", "\\n").replace('"', '\\\"')
-        # code = "val sprk_sql = spark.sql(\"" + escapedSQL + "\")\nval sprk_res=sprk_sql.collect\n%json sprk_res"  # .format(escapedSQL)
+        """ 
+        Format SQL statement. Add trailing space if necessary.
+        If query finishes with single quote ('),
+        the execution of the query will fail. Ex: WHERE column='foo'
+        """
+        # Remove comments
+        formatted_sql = re.sub(r"\s*/\*(.|\n)*?\*/\s*", "\n", sql, re.DOTALL).strip()
+        
+        if formatted_sql.endswith("'"):
+            return formatted_sql + " "
+        
+        return formatted_sql
 
-        # TODO: since the above code is not changed to sending direct SQL to the livy backend, client side string escaping is probably not needed
-
-        code = re.sub(r"\s*/\*(.|\n)*?\*/\s*", "\n", sql, re.DOTALL).strip()
-        return code
+    def _cancel_statement(self, statement_id) -> None:
+        logger.debug(f"Cancelling statement: {statement_id}")
+        try:
+            _ = requests.post(
+                self.connect_url
+                + "/sessions/"
+                + self.session_id
+                + "/statements/"
+                + statement_id
+                + "/cancel",
+                headers=get_headers(self.credential, False),
+            )
+            if _.status_code == 200:
+                logger.debug(f"Cancelled statement: {statement_id}")
+            else:
+                response.raise_for_status()
+        except Exception as ex:
+            logger.error(f"Unable to cancel the statement {statement_id}, error: {ex}")
 
     def _getLivyResult(self, res_obj) -> Response:
+        start_time = time.time()
+        elapsed_time = 0
+        res = None
+ 
         json_res = res_obj.json()
+        statement_id = repr(json_res["id"])
+ 
         while True:
+            elapsed_time = time.time() - start_time
+            remaining_time = self.credentials.session_provisioning_timeout - elapsed_time
+
             res = requests.get(
                 self.connect_url
                 + "/sessions/"
                 + self.session_id
                 + "/statements/"
-                + repr(json_res["id"]),
+                + statement_id,
                 headers=get_headers(self.credential, False),
             ).json()
 
-            # print(res)
-            if res["state"] == "available":
-                return res
-            time.sleep(DEFAULT_POLL_STATEMENT_WAIT)
+            if res.state in [LivyStatementStates.AVAILABLE, LivyStatementStates.ERROR, LivyStatementStates.CANCELLING, LivyStatementStates.CANCELLED]:
+                break
+            time.sleep(DEFAULT_STATEMENT_POLL_WAIT)
+
+            if remaining_time <= 0:
+                self._cancel_statement(statement_id)
+                raise TimeoutError(f"Query took more than {self.credentials.query_timeout} seconds to run")
+            
+            return res
 
     def execute(self, sql: str, *parameters: Any) -> None:
         """
@@ -349,7 +401,7 @@ class LivyCursor:
         # TODO: handle parameterised sql
 
         res = self._getLivyResult(self._submitLivyCode(self._getLivySQL(sql)))
-        logger.debug(res)
+        logger.debug(f"Livy statement result: {res}")
         if res["output"]["status"] == "ok":
             # values = res['output']['data']['application/json']
             values = res["output"]["data"]["application/json"]
@@ -365,7 +417,7 @@ class LivyCursor:
             self._rows = None
             self._schema = None
 
-            raise dbt.exceptions.DbtDatabaseError(
+            raise DbtDatabaseError(
                 "Error while executing query: " + res["output"]["evalue"]
             )
 
@@ -416,18 +468,18 @@ class LivyConnection:
     """
 
     def __init__(self, credentials, livy_session) -> None:
-        self.credential: SparkCredentials = credentials
-        self.connect_url = credentials.lakehouse_endpoint
+        self.credentials: SparkCredentials = credentials
+        self.connect_url = credentials.livy_endpoint
         self.session_id = livy_session.session_id
         self.livy_session_parameters = credentials.livy_session_parameters
 
-        self._cursor = LivyCursor(self.credential, livy_session)
+        self._cursor = LivyCursor(self.credentials, livy_session)
 
     def get_session_id(self) -> str:
         return self.session_id
 
     def get_headers(self) -> dict[str, str]:
-        return get_headers(self.credential, False)
+        return get_headers(self.credentials, False)
 
     def get_connect_url(self) -> str:
         return self.connect_url
@@ -500,7 +552,7 @@ class LivySessionManager:
 
 
 class LivySessionConnectionWrapper(object):
-    """Connection wrapper for the livy sessoin connection method."""
+    """Connection wrapper for the livy session connection method."""
 
     def __init__(self, handle):
         self.handle = handle

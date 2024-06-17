@@ -3,7 +3,7 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
-from dbt.events import AdapterLogger
+from dbt.adapters.events.logging import AdapterLogger
 
 logger = AdapterLogger("Microsoft Fabric-Spark")
 

@@ -51,7 +51,7 @@ def _get_dbt_core_version():
 
 
 package_name = "dbt-fabricspark"
-package_version = "1.7.0rc1"
+package_version = "1.8.0"
 dbt_core_version = _get_dbt_core_version()
 print(f"printing version --------- {dbt_core_version}")
 description = """The Apache Spark adapter plugin for dbt"""
@@ -69,6 +69,9 @@ setup(
     include_package_data=True,
     install_requires=[
         "dbt-core~={}".format(dbt_core_version),
+        "sqlparams>=3.0.0",
+        "dbt-common>=1.3.0",
+        "dbt-adapters>=1.2.1",
         "azure-identity>=1.13.0",
         "azure-core>=1.26.4",
         "azure-cli==2.60.0"
@@ -84,6 +87,7 @@ setup(
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
     ],
     python_requires=">=3.8",
 )
